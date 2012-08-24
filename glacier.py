@@ -287,7 +287,7 @@ def listvaults(config):
 
 def uploadFile(config, vault, filename, description=None):
     basename = os.path.basename(filename)
-    req = Request(config, 'POST', '/-/vaults/' + vault + '/' + basename)
+    req = Request(config, 'POST', '/-/vaults/' + vault + '/archives')
     if description != None:
         req.headers['x-amz-archive-description'] = description
 
