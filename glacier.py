@@ -347,8 +347,8 @@ def getJobOutput(config, vault, jobid, joboutput=None):
 
 
 def usage():
-    print('\nusage: ' + sys.argv[0] + ' [options]\n');
-    #print('  --filename            Set the filename for operations later on the command line');
+    me = os.path.basename(sys.argv[0])
+    print('\nUsage: ' + me + ' [options]\n');
     print('  --vault               Set the vault name for file operations later on the command line');
     print('  --description         Set the file description for file operations later');
     print('  --upload              Single part upload of a file');
@@ -373,20 +373,20 @@ def usage():
     print('')
     print('Examples: ');
     print('')
-    print('  '+ sys.argv[0] + ' --makeprofile timmy')
-    print('  '+ sys.argv[0] + ' --profile timmy --id myid --key mykey')
-    print('  '+ sys.argv[0] + ' --profile timmy --makevault myvault')
-    print('  '+ sys.argv[0] + ' --deletevault myvault  (uses DEFAULT profile)')
-    print('  '+ sys.argv[0] + ' --describevault myvault  (uses DEFAULT profile)')
-    print('  '+ sys.argv[0] + ' --listvaults  (uses DEFAULT profile)')
+    print('  '+ me + ' --makeprofile timmy')
+    print('  '+ me + ' --profile timmy --id myid --key mykey')
+    print('  '+ me + ' --profile timmy --makevault myvault')
+    print('  '+ me + ' --deletevault myvault  (uses DEFAULT profile)')
+    print('  '+ me + ' --describevault myvault  (uses DEFAULT profile)')
+    print('  '+ me + ' --listvaults  (uses DEFAULT profile)')
     print('')
-    print('  '+ sys.argv[0] + ' --makevault test')
-    print('  '+ sys.argv[0] + ' --vault test --upload ~/examples.desktop')
-    print('  '+ sys.argv[0] + ' --vault test --delete ')
+    print('  '+ me + ' --makevault test')
+    print('  '+ me + ' --vault test --upload ~/examples.desktop')
+    print('  '+ me + ' --vault test --delete <ArchiveId>')
     print('')
-    print('  '+ sys.argv[0] + ' --vault test --createjob inventory-retrieval')
-    print('  '+ sys.argv[0] + ' --vault test --listjobs')
-    print('  '+ sys.argv[0] + ' --vault test --joboutput result.txt --getjob <JobId>')
+    print('  '+ me + ' --vault test --createjob inventory-retrieval')
+    print('  '+ me + ' --vault test --listjobs')
+    print('  '+ me + ' --vault test --joboutput result.txt --getjob <JobId>')
     print('')
     print('')
 
