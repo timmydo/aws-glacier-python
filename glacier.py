@@ -29,6 +29,8 @@ import hmac
 import configparser
 import os
 import http.client
+import io
+import json
 
 from urllib.parse import urlparse
 #from email.utils import formatdate
@@ -90,19 +92,24 @@ def hexhash(data):
     return h.hexdigest()
 
 def hashfile(filename, chunksize=ONE_MB):
+    with open(filename, 'rb') as infile:
+        return hashstream(infile, chunksize)
+
+
+def hashstream(infile, chunksize=ONE_MB):
     h = hashlib.sha256()
     treehashlist = []
-    with open(filename, 'rb') as infile:
-        while True:
-            data = infile.read(chunksize)
-            if len(data) == 0:
-                break
-            th = hashlib.sha256()
-            th.update(data)
-            treehashlist += [th.digest()]
-            h.update(data)
+    while True:
+        data = infile.read(chunksize)
+        if len(data) == 0:
+            break
+        th = hashlib.sha256()
+        th.update(data)
+        treehashlist += [th.digest()]
+        h.update(data)
 
     return h.digest(), treehash(treehashlist)
+
 
 def hashpair(x,y):
     h = hashlib.sha256()
@@ -158,6 +165,13 @@ class Request():
             self.payload = fb.read()
 
         linearhash, treehash = hashfile(filename)
+        self.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
+        self.headers['x-amz-content-sha256'] = binascii.hexlify(linearhash).decode('ascii')
+
+
+    def setPayloadContents(self, payload):
+        self.payload = payload
+        linearhash, treehash = hashstream(io.BytesIO(self.payload))
         self.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
         self.headers['x-amz-content-sha256'] = binascii.hexlify(linearhash).decode('ascii')
 
@@ -235,7 +249,7 @@ class Request():
 
         return s
 
-    def send(self, config):
+    def send(self, config, outfile=None):
         con = http.client.HTTPConnection(config['host'], int(config['port']))
         con.set_debuglevel(self.debug)
         con.request(self.method, self.url, self.payload, self.headers)
@@ -246,12 +260,20 @@ class Request():
             print("\n\nStatus: " + str(res.status))
             print("Reason: " + str(res.reason))
             print("Headers: " + str(res.getheaders()))
-            
-        reply = res.read()
-
-        print("Reply:\n" + str(reply))
+        
+        if outfile == None:
+            reply = res.read()
+            print("Reply:\n" + str(reply))
+        else:
+            with open(outfile, 'wb') as of:
+                while True:
+                    x = res.read(4096)
+                    if len(x) == 0:
+                        break
+                    of.write(x)
 
         con.close()
+
 
     def __str__(self):
         s = self.method + ' ' + self.url + ' HTTP/1.1\n'
@@ -297,6 +319,31 @@ def uploadFile(config, vault, filename, description=None):
     req.send(config)
 
 
+def deleteFile(config, vault, archiveid):
+    req = Request(config, 'DELETE', '/-/vaults/' + vault + '/archives/' + archiveid)
+    req.addContentLength()
+    req.sign()
+    req.send(config)
+
+def createJob(config, vault, params):
+    req = Request(config, 'POST', '/-/vaults/' + vault + '/jobs')
+    req.setPayloadContents(json.dumps(params).encode('utf-8'))
+    req.addContentLength()
+    req.sign()
+    req.send(config)
+
+def listJobs(config, vault, joboutput=None):
+    req = Request(config, 'GET', '/-/vaults/' + vault + '/jobs')
+    req.addContentLength()
+    req.sign()
+    req.send(config, joboutput)
+
+def getJobOutput(config, vault, jobid, joboutput=None):
+    req = Request(config, 'GET', '/-/vaults/' + vault + '/jobs/' + jobid + '/output')
+    req.addContentLength()
+    req.sign()
+    req.send(config, joboutput)
+
 
 
 def usage():
@@ -305,6 +352,7 @@ def usage():
     print('  --vault               Set the vault name for file operations later on the command line');
     print('  --description         Set the file description for file operations later');
     print('  --upload              Single part upload of a file');
+    print('  --delete              Delete an uploaded archive');
     print('')
     print('  --makeprofile         Make a configuration profile with the given name');
     print('  --profile             Set the config profile');
@@ -318,6 +366,11 @@ def usage():
     print('  --describevault       Describe a vault');
     print('  --listvaults          List the vaults');
     print('')
+    print('  --createjob           Create a job for downloading an archive or viewing a vault inventory');
+    print('  --listjobs            List the jobs in a vault');
+    print('  --getjob              Get the output from a job');
+    print('  --joboutput           Set the output file for a job output task');
+    print('')
     print('Examples: ');
     print('')
     print('  '+ sys.argv[0] + ' --makeprofile timmy')
@@ -327,6 +380,14 @@ def usage():
     print('  '+ sys.argv[0] + ' --describevault myvault  (uses DEFAULT profile)')
     print('  '+ sys.argv[0] + ' --listvaults  (uses DEFAULT profile)')
     print('')
+    print('  '+ sys.argv[0] + ' --makevault test')
+    print('  '+ sys.argv[0] + ' --vault test --upload ~/examples.desktop')
+    print('  '+ sys.argv[0] + ' --vault test --delete ')
+    print('')
+    print('  '+ sys.argv[0] + ' --vault test --createjob inventory-retrieval')
+    print('  '+ sys.argv[0] + ' --vault test --listjobs')
+    print('  '+ sys.argv[0] + ' --vault test --joboutput result.txt --getjob <JobId>')
+    print('')
     print('')
 
 def main():
@@ -334,12 +395,15 @@ def main():
     profile = DEFAULT_PROFILE
     vault = ''
     description = None
+    joboutput = None
 
     options, rem = getopt.getopt(sys.argv[1:], 'h', ['help', 'description=',
                                                      'region=','id=','key=',
                                                      'makevault=', 'deletevault=',
                                                      'describevault=', 'listvaults',
-                                                     'vault=', 'upload=',
+                                                     'vault=', 'upload=', 'delete=',
+                                                     'createjob=', 'listjobs', 'getjob=',
+                                                     'joboutput=',
                                                      'profile=', 'makeprofile='])
     if len(options) == 0:
         usage()
@@ -353,11 +417,39 @@ def main():
             saveConfig(config)
         elif opt in ['--vault']:
             vault = arg
+        elif opt in ['--joboutput']:
+            joboutput = arg
         elif opt in ['--upload']:
             if vault != '':
                 uploadFile(config[profile], vault, arg, description)
             else:
                 print("Vault not specified, skipping upload...")
+        elif opt in ['--delete']:
+            if vault != '':
+                deleteFile(config[profile], vault, arg)
+            else:
+                print("Vault not specified, skipping delete...")
+        elif opt in ['--listjobs']:
+            if vault != '':
+                listJobs(config[profile], vault, joboutput)
+            else:
+                print("Vault not specified, skipping list jobs...")
+        elif opt in ['--getjob']:
+            if vault != '':
+                getJobOutput(config[profile], vault, arg, joboutput)
+            else:
+                print("Vault not specified, skipping get job...")
+        elif opt in ['--createjob']:
+            if vault != '':
+                if arg in ['archive-retrieval', 'inventory-retrieval']:
+                    params = {'Type': arg, 'Format':'JSON'}
+                    if description != None:
+                        params['Description'] = description
+                    createJob(config[profile], vault, params)
+                else:
+                    print("Job type not archive-retrieval or inventory-retrieval")
+            else:
+                print("Vault not specified, skipping createjob...")
         elif opt in ['--description']:
             description = arg
         elif opt in ['--profile']:
