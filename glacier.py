@@ -256,10 +256,10 @@ class Request():
 
 
         res = con.getresponse()
-        if self.debug:
-            print("\n\nStatus: " + str(res.status))
-            print("Reason: " + str(res.reason))
-            print("Headers: " + str(res.getheaders()))
+#        if self.debug:
+        print("\n\nStatus: " + str(res.status))
+        print("Reason: " + str(res.reason))
+        print("Headers: " + str(res.getheaders()))
         
         if outfile == None:
             reply = res.read()
@@ -370,6 +370,7 @@ def usage():
     print('  --listjobs            List the jobs in a vault');
     print('  --getjob              Get the output from a job');
     print('  --joboutput           Set the output file for a job output task');
+    print('  --archive             Set the archive id for an archive retrieval job');
     print('')
     print('Examples: ');
     print('')
@@ -387,6 +388,7 @@ def usage():
     print('  '+ me + ' --vault test --createjob inventory-retrieval')
     print('  '+ me + ' --vault test --listjobs')
     print('  '+ me + ' --vault test --joboutput result.txt --getjob <JobId>')
+    print('  '+ me + ' --vault test --archive <ArchiveId> --createjob archive-retrieval')
     print('')
     print('')
 
@@ -396,6 +398,7 @@ def main():
     vault = ''
     description = None
     joboutput = None
+    archive = None
 
     options, rem = getopt.getopt(sys.argv[1:], 'h', ['help', 'description=',
                                                      'region=','id=','key=',
@@ -403,7 +406,7 @@ def main():
                                                      'describevault=', 'listvaults',
                                                      'vault=', 'upload=', 'delete=',
                                                      'createjob=', 'listjobs', 'getjob=',
-                                                     'joboutput=',
+                                                     'joboutput=', 'archive=',
                                                      'profile=', 'makeprofile='])
     if len(options) == 0:
         usage()
@@ -419,6 +422,8 @@ def main():
             vault = arg
         elif opt in ['--joboutput']:
             joboutput = arg
+        elif opt in ['--archive']:
+            archive = arg
         elif opt in ['--upload']:
             if vault != '':
                 uploadFile(config[profile], vault, arg, description)
@@ -442,9 +447,13 @@ def main():
         elif opt in ['--createjob']:
             if vault != '':
                 if arg in ['archive-retrieval', 'inventory-retrieval']:
-                    params = {'Type': arg, 'Format':'JSON'}
+                    params = {'Type': arg}
+                    if arg in ['inventory-retrieval']:
+                        params['Format'] = 'JSON'
                     if description != None:
                         params['Description'] = description
+                    if archive != None:
+                        params['ArchiveId'] = archive
                     createJob(config[profile], vault, params)
                 else:
                     print("Job type not archive-retrieval or inventory-retrieval")
