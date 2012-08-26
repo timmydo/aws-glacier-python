@@ -143,6 +143,7 @@ class Request():
         self.accesskey = config['key']
         self.region = config['region']
         self.debug = int(config['debug'])
+        self.hideResponseHeaders = False
         self.method = method
         self.url = url
         self.headers = {}
@@ -256,10 +257,10 @@ class Request():
 
 
         res = con.getresponse()
-#        if self.debug:
-        print("\n\nStatus: " + str(res.status))
-        print("Reason: " + str(res.reason))
-        print("Headers: " + str(res.getheaders()))
+        if not self.hideResponseHeaders:
+            print("\n\nStatus: " + str(res.status))
+            print("Reason: " + str(res.reason))
+            print("Headers: " + str(res.getheaders()))
         
         if outfile == None:
             reply = res.read()
@@ -273,6 +274,7 @@ class Request():
                     of.write(x)
 
         con.close()
+        return res
 
 
     def __str__(self):
@@ -308,7 +310,6 @@ def listvaults(config):
     req.send(config)
 
 def uploadFile(config, vault, filename, description=None):
-    basename = os.path.basename(filename)
     req = Request(config, 'POST', '/-/vaults/' + vault + '/archives')
     if description != None:
         req.headers['x-amz-archive-description'] = description
@@ -318,6 +319,71 @@ def uploadFile(config, vault, filename, description=None):
     req.sign()
     req.send(config)
 
+def getFilePart(filename, offset, partsize):
+    with open(filename, 'rb') as fb:
+        fb.seek(offset)
+        return fb.read(partsize)
+
+def multipartUploadFile(config, vault, filename, description=None, partsize=1024*1024*4):
+    req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads')
+    if description != None:
+        req.headers['x-amz-archive-description'] = description
+    req.headers['x-amz-part-size'] = str(partsize)
+
+    req.addContentLength()
+    req.sign()
+    res = req.send(config)
+    if 'x-amz-multipart-upload-id' not in res.headers:
+        raise KeyError('x-amz-multipart-upload-id not in response headers')
+    uploadid = res.headers['x-amz-multipart-upload-id']
+
+    print('Starting upload of ' + filename)
+    
+    offset = 0
+    size = os.stat(filename).st_size
+
+    while offset < size:
+        req = Request(config, 'PUT', '/-/vaults/' + vault + '/multipart-uploads/' + uploadid)
+        part = getFilePart(filename, offset, partsize)
+        req.headers['Content-Range'] = 'bytes ' + str(offset) + '-' + str(len(part)-1) + '/*'
+        req.setPayloadContents(part)
+
+        req.addContentLength()
+        req.sign()
+        req.hideResponseHeaders = True
+        res = req.send(config)
+        if res.status != 204:
+            raise ValueError('Expected 204 response from multipart PUT request @ offset ' + str(offset))
+
+        print('Uploaded ' + str(partsize/1024/1024) + ' MB @ offset ' + str(offset) + ' bytes')
+        offset += len(part)
+
+    print('Calculating hash and finishing upload of ' + filename)
+
+    req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads/'+uploadid)
+    req.headers['x-amz-archive-size'] = str(size)
+    linearhash, treehash = hashfile(filename)
+    req.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
+    req.addContentLength()
+    req.sign()
+    res = req.send(config)
+
+    print('Uploaded ' + filename)
+    if res.status != 201:
+        raise ValueError('Expected 201 Created response from upload finish request')
+
+
+def listUploads(config, vault):
+    req = Request(config, 'GET', '/-/vaults/' + vault + '/multipart-uploads')
+    req.addContentLength()
+    req.sign()
+    req.send(config)
+
+def abortUpload(config, vault, uploadid):
+    req = Request(config, 'DELETE', '/-/vaults/' + vault + '/multipart-uploads/' + uploadid)
+    req.addContentLength()
+    req.sign()
+    req.send(config)
 
 def deleteFile(config, vault, archiveid):
     req = Request(config, 'DELETE', '/-/vaults/' + vault + '/archives/' + archiveid)
@@ -352,6 +418,9 @@ def usage():
     print('  --vault               Set the vault name for file operations later on the command line');
     print('  --description         Set the file description for file operations later');
     print('  --upload              Single part upload of a file');
+    print('  --mupload             Multipart upload of a file');
+    print('  --listuploads         List the current multipart uploads');
+    print('  --abortupload         Abort a multipart upload');
     print('  --delete              Delete an uploaded archive');
     print('')
     print('  --makeprofile         Make a configuration profile with the given name');
@@ -383,7 +452,10 @@ def usage():
     print('')
     print('  '+ me + ' --makevault test')
     print('  '+ me + ' --vault test --upload ~/examples.desktop')
+    print('  '+ me + ' --vault test --multipartupload ~/examples.desktop')
     print('  '+ me + ' --vault test --delete <ArchiveId>')
+    print('  '+ me + ' --vault test --listuploads')
+    print('  '+ me + ' --vault test --abortupload <MultipartUploadId>')
     print('')
     print('  '+ me + ' --vault test --createjob inventory-retrieval')
     print('  '+ me + ' --vault test --listjobs')
@@ -407,11 +479,15 @@ def main():
                                                      'vault=', 'upload=', 'delete=',
                                                      'createjob=', 'listjobs', 'getjob=',
                                                      'joboutput=', 'archive=',
+                                                     'mupload=', 'listuploads', 'abortupload=',
                                                      'profile=', 'makeprofile='])
     if len(options) == 0:
         usage()
         sys.exit(0)
-
+    
+    def requireVault(opt):
+        if len(vault) == 0:
+            raise ValueError('Vault required for option: ' + opt)
 
     for opt, arg in options:
         if opt in ['--region']:
@@ -425,40 +501,40 @@ def main():
         elif opt in ['--archive']:
             archive = arg
         elif opt in ['--upload']:
-            if vault != '':
-                uploadFile(config[profile], vault, arg, description)
-            else:
-                print("Vault not specified, skipping upload...")
+            requireVault(opt)
+            uploadFile(config[profile], vault, arg, description)
+        elif opt in ['--mupload']:
+            requireVault(opt)
+            multipartUploadFile(config[profile], vault, arg, description)
         elif opt in ['--delete']:
-            if vault != '':
-                deleteFile(config[profile], vault, arg)
-            else:
-                print("Vault not specified, skipping delete...")
+            requireVault(opt)
+            deleteFile(config[profile], vault, arg)
+        elif opt in ['--listuploads']:
+            requireVault(opt)
+            listUploads(config[profile], vault)
+        elif opt in ['--abortupload']:
+            requireVault(opt)
+            abortUpload(config[profile], vault, arg)
         elif opt in ['--listjobs']:
-            if vault != '':
-                listJobs(config[profile], vault, joboutput)
-            else:
-                print("Vault not specified, skipping list jobs...")
+            requireVault(opt)
+            listJobs(config[profile], vault, joboutput)
         elif opt in ['--getjob']:
-            if vault != '':
-                getJobOutput(config[profile], vault, arg, joboutput)
-            else:
-                print("Vault not specified, skipping get job...")
+            requireVault(opt)
+            getJobOutput(config[profile], vault, arg, joboutput)
         elif opt in ['--createjob']:
-            if vault != '':
-                if arg in ['archive-retrieval', 'inventory-retrieval']:
-                    params = {'Type': arg}
-                    if arg in ['inventory-retrieval']:
-                        params['Format'] = 'JSON'
-                    if description != None:
-                        params['Description'] = description
-                    if archive != None:
-                        params['ArchiveId'] = archive
-                    createJob(config[profile], vault, params)
-                else:
-                    print("Job type not archive-retrieval or inventory-retrieval")
+            requireVault(opt)
+            if arg in ['archive-retrieval', 'inventory-retrieval']:
+                params = {'Type': arg}
+                if arg in ['inventory-retrieval']:
+                    params['Format'] = 'JSON'
+                if description != None:
+                    params['Description'] = description
+                if archive != None:
+                    params['ArchiveId'] = archive
+
+                createJob(config[profile], vault, params)
             else:
-                print("Vault not specified, skipping createjob...")
+                raise ValueError("Job type not archive-retrieval or inventory-retrieval")
         elif opt in ['--description']:
             description = arg
         elif opt in ['--profile']:
