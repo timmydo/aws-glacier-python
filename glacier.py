@@ -32,7 +32,7 @@ import http.client
 import io
 import json
 
-from urllib.parse import urlparse
+from urllib.parse import urlparse,parse_qs
 #from email.utils import formatdate
 import datetime
 
@@ -108,7 +108,7 @@ def hashstream(infile, chunksize=ONE_MB):
         treehashlist += [th.digest()]
         h.update(data)
 
-    return h.digest(), treehash(treehashlist)
+    return h.digest(), treehash(treehashlist), treehashlist
 
 
 def hashpair(x,y):
@@ -121,8 +121,13 @@ def treehash(lines):
     if len(lines) == 0:
         return hashpair(b'',b'')
     while len(lines) > 1:
-        pairs = zip(lines[::2], lines[1::2])
-        lines = [hashpair(x,y) for x,y in pairs]
+        lista = lines[::2]
+        listb = lines[1::2]
+        extra = []
+        if len(lista) > len(listb):
+            extra = [lista[-1]]
+        pairs = zip(lista, listb)
+        lines = [hashpair(x,y) for x,y in pairs] + extra
     return lines[0]
     
 def getBasicDateTime():
@@ -165,14 +170,14 @@ class Request():
         with open(filename, 'rb') as fb:
             self.payload = fb.read()
 
-        linearhash, treehash = hashfile(filename)
+        linearhash, treehash, thl = hashfile(filename)
         self.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
         self.headers['x-amz-content-sha256'] = binascii.hexlify(linearhash).decode('ascii')
 
 
     def setPayloadContents(self, payload):
         self.payload = payload
-        linearhash, treehash = hashstream(io.BytesIO(self.payload))
+        linearhash, treehash, thl = hashstream(io.BytesIO(self.payload))
         self.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
         self.headers['x-amz-content-sha256'] = binascii.hexlify(linearhash).decode('ascii')
 
@@ -218,7 +223,7 @@ class Request():
 
     def getCanonicalString(self):
         urlparts = urlparse(self.url)
-        querystring = ''
+        querystring = parse_qs(urlparts.query)
         can_headers = {}
         ok_keys = ['content-sha256', 'content-type', 'date', 'host']
 
@@ -227,10 +232,21 @@ class Request():
             if self.headers[key] is not None and (lk in ok_keys or lk.startswith('x-amz-')):
                 can_headers[lk] = self.headers[key].strip()
 
+        canquerystring = ''
+        for key in sorted(querystring):
+            val = querystring[key]
+            canquerystring += '&' + key + '=' + val[0].strip() + '\n'
+
+        if len(canquerystring) == 0:
+            canquerystring = '\n'
+        else:
+            if (canquerystring[0] == '&'):
+                canquerystring = canquerystring[1:]
+            
 
         s = self.method + '\n'
-        s += self.url + '\n'
-        s += querystring + '\n'
+        s += urlparts.path + '\n'
+        s += canquerystring
         signedheaders = ''
         for key in sorted(can_headers.keys()):
             val = can_headers[key]
@@ -262,9 +278,11 @@ class Request():
             print("Reason: " + str(res.reason))
             print("Headers: " + str(res.getheaders()))
         
+        reply = None
         if outfile == None:
             reply = res.read()
-            print("Reply:\n" + str(reply))
+            if not self.hideResponseHeaders:
+                print("Reply:\n" + str(reply))
         else:
             with open(outfile, 'wb') as of:
                 while True:
@@ -274,7 +292,7 @@ class Request():
                     of.write(x)
 
         con.close()
-        return res
+        return res, reply
 
 
     def __str__(self):
@@ -324,49 +342,139 @@ def getFilePart(filename, offset, partsize):
         fb.seek(offset)
         return fb.read(partsize)
 
-def multipartUploadFile(config, vault, filename, description=None, partsize=1024*1024*4):
-    req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads')
-    if description != None:
-        req.headers['x-amz-archive-description'] = description
-    req.headers['x-amz-part-size'] = str(partsize)
-
+def listParts(config, vault, uploadid, marker=None):
+    query = '/-/vaults/' + vault + '/multipart-uploads/' + uploadid
+    if marker != None:
+        query += '?marker=' + marker
+    req = Request(config, 'GET', query)
+    req.hideResponseHeaders = True
     req.addContentLength()
     req.sign()
-    res = req.send(config)
-    if 'x-amz-multipart-upload-id' not in res.headers:
-        raise KeyError('x-amz-multipart-upload-id not in response headers')
-    uploadid = res.headers['x-amz-multipart-upload-id']
+    return req.send(config)
 
-    print('Starting upload of ' + filename)
-    
+def findUploadedFileOffset(config, vault, uploadid):
+    parts = []
+    marker = None
+    while True:
+        res, reply = listParts(config, vault, uploadid, marker)
+        partreply = json.loads(reply.decode('utf-8'))
+        parts += partreply['Parts']
+        marker = partreply['Marker']
+        if marker == None:
+            break
+
+    # TODO? verify the treehashes?
+    maxoffset = 0
+    for item in parts:
+        maxval = int(item['RangeInBytes'].split('-')[1])
+        maxoffset = max(maxoffset, maxval)
+    return maxoffset, parts
+
+def treehashFromList(thl, start, end):
+    start = start//1024//1024
+    end = end//1024//1024
+    hashparts = thl[start:end]
+    return treehash(hashparts)
+
+def checkHashes(config, vault, filename, uploadid):
+    offset, parts = findUploadedFileOffset(config, vault, uploadid)
+    badhashes = []
+    fullhash, treehash, thl = hashfile(filename)
+    for part in parts:
+        rng = [int(x) for x in part['RangeInBytes'].split('-')]
+        mytreehash = binascii.hexlify(treehashFromList(thl, rng[0], rng[1])).decode('ascii')
+        # ??? aws puts '01' at the beginning of their hash?
+        if mytreehash not in part['SHA256TreeHash']:
+            badhashes += [part]
+            print("Hash mismatch: " + str(part) + "\nExpected: " + str(mytreehash)
+                  + "\nAt offset: " + str(rng[0]//1024//1024) + " MB to "
+                  + str(rng[1]//1024//1024) + ' MB')
+    print('Checked ' + str(len(parts)) + ' hashes')
+    print('Full file hash: ' + binascii.hexlify(fullhash).decode('ascii'))
+    print('Full file treehash: ' + binascii.hexlify(treehash).decode('ascii'))
+    return badhashes
+        
+def repairMultipartFile(config, vault, filename, uploadid, partsize=1024*1024*4):
+    parts = checkHashes(config, vault, filename, uploadid)
+    for part in parts:
+        rng = [int(x) for x in part['RangeInBytes'].split('-')]
+
+
+        offset = rng[0]
+        part = getFilePart(filename, offset, partsize)
+
+        # len(part) will work for chunks and the last chunk in the file rather than partsize
+        if (rng[1] - rng[0] != len(part)):
+            raise ValueError('Part size expected: ' + str(partsize) + ' found: ' + str(rng[1] - rng[0]))
+
+
+        req = Request(config, 'PUT', '/-/vaults/' + vault + '/multipart-uploads/' + uploadid)
+        part = getFilePart(filename, offset, partsize)
+        req.headers['Content-Range'] = 'bytes ' + str(offset) + '-' + str(offset+len(part)-1) + '/*'
+        req.setPayloadContents(part)
+
+        req.addContentLength()
+        req.sign()
+        #req.hideResponseHeaders = True
+        res, reply = req.send(config)
+        if res.status != 204:
+            raise ValueError('Expected 204 response from multipart PUT request @ offset ' + str(offset))
+
+        print('Repaired part at offset ' + str(offset) + ' (' + str(offset//1024//1024) + ' MB)')
+
+
+
+def multipartUploadFile(config, vault, filename, description=None, uploadid=None, partsize=1024*1024*4):
     offset = 0
     size = os.stat(filename).st_size
+
+    # uploadid is set to the multipart upload id or None if starting for the first time
+    if uploadid == None:
+        req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads')
+        if description != None:
+            req.headers['x-amz-archive-description'] = description
+        req.headers['x-amz-part-size'] = str(partsize)
+
+        req.addContentLength()
+        req.sign()
+        req.hideResponseHeaders = True
+        res, reply = req.send(config)
+        if 'x-amz-multipart-upload-id' not in res.headers:
+            raise KeyError('x-amz-multipart-upload-id not in response headers')
+        uploadid = res.headers['x-amz-multipart-upload-id']
+        print('Starting upload of ' + filename)
+        print('Upload ID: ' + str(uploadid))
+    else:
+        uploadid = uploadid
+        offset, parts = findUploadedFileOffset(config, vault, uploadid)
+        print('Resuming upload at offset: ' + str(offset) + ' (' + str(offset//1024//1024) + ' MB)')
+
 
     while offset < size:
         req = Request(config, 'PUT', '/-/vaults/' + vault + '/multipart-uploads/' + uploadid)
         part = getFilePart(filename, offset, partsize)
-        req.headers['Content-Range'] = 'bytes ' + str(offset) + '-' + str(len(part)-1) + '/*'
+        req.headers['Content-Range'] = 'bytes ' + str(offset) + '-' + str(offset+len(part)-1) + '/*'
         req.setPayloadContents(part)
 
         req.addContentLength()
         req.sign()
         req.hideResponseHeaders = True
-        res = req.send(config)
+        res, reply = req.send(config)
         if res.status != 204:
             raise ValueError('Expected 204 response from multipart PUT request @ offset ' + str(offset))
 
-        print('Uploaded ' + str(partsize/1024/1024) + ' MB @ offset ' + str(offset) + ' bytes')
+        print('Uploaded ' + str(len(part)/1024/1024) + ' MB @ offset ' + str(offset) + ' bytes (' + str(offset//1024//1024) + ' MB)')
         offset += len(part)
 
     print('Calculating hash and finishing upload of ' + filename)
 
     req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads/'+uploadid)
     req.headers['x-amz-archive-size'] = str(size)
-    linearhash, treehash = hashfile(filename)
+    linearhash, treehash, thl = hashfile(filename)
     req.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
     req.addContentLength()
     req.sign()
-    res = req.send(config)
+    res, reply = req.send(config)
 
     print('Uploaded ' + filename)
     if res.status != 201:
@@ -419,7 +527,11 @@ def usage():
     print('  --description         Set the file description for file operations later');
     print('  --upload              Single part upload of a file');
     print('  --mupload             Multipart upload of a file');
+    print('  --resumeupload        Resume a multipart upload of a file');
+    print('  --checkhashes         Check hashes on a paused multipart upload of a file');
     print('  --listuploads         List the current multipart uploads');
+    print('  --listparts           List the parts of a multipart upload');
+    print('  --repairparts         Repair the parts of a multipart upload');
     print('  --abortupload         Abort a multipart upload');
     print('  --delete              Delete an uploaded archive');
     print('')
@@ -456,6 +568,10 @@ def usage():
     print('  '+ me + ' --vault test --delete <ArchiveId>')
     print('  '+ me + ' --vault test --listuploads')
     print('  '+ me + ' --vault test --abortupload <MultipartUploadId>')
+    print('  '+ me + ' --vault test --listparts <MultipartUploadId>')
+    print('  '+ me + ' --vault test --filename <filename> --resumeupload <MultipartUploadId>')
+    print('  '+ me + ' --vault test --filename <filename> --checkhashes <MultipartUploadId>')
+    print('  '+ me + ' --vault test --filename <filename> --repairparts <MultipartUploadId>')
     print('')
     print('  '+ me + ' --vault test --createjob inventory-retrieval')
     print('  '+ me + ' --vault test --listjobs')
@@ -471,6 +587,7 @@ def main():
     description = None
     joboutput = None
     archive = None
+    filename = None
 
     options, rem = getopt.getopt(sys.argv[1:], 'h', ['help', 'description=',
                                                      'region=','id=','key=',
@@ -480,6 +597,8 @@ def main():
                                                      'createjob=', 'listjobs', 'getjob=',
                                                      'joboutput=', 'archive=',
                                                      'mupload=', 'listuploads', 'abortupload=',
+                                                     'filename=', 'resume=', 'listparts=',
+                                                     'checkhashes=', 'repairparts=',
                                                      'profile=', 'makeprofile='])
     if len(options) == 0:
         usage()
@@ -498,6 +617,8 @@ def main():
             vault = arg
         elif opt in ['--joboutput']:
             joboutput = arg
+        elif opt in ['--filename']:
+            filename = arg
         elif opt in ['--archive']:
             archive = arg
         elif opt in ['--upload']:
@@ -505,7 +626,19 @@ def main():
             uploadFile(config[profile], vault, arg, description)
         elif opt in ['--mupload']:
             requireVault(opt)
-            multipartUploadFile(config[profile], vault, arg, description)
+            multipartUploadFile(config[profile], vault, arg, description, None)
+        elif opt in ['--listparts']:
+            requireVault(opt)
+            listParts(config[profile], vault, arg)
+        elif opt in ['--resume']:
+            requireVault(opt)
+            multipartUploadFile(config[profile], vault, filename, None, arg)
+        elif opt in ['--checkhashes']:
+            requireVault(opt)
+            checkHashes(config[profile], vault, filename, arg)
+        elif opt in ['--repairparts']:
+            requireVault(opt)
+            repairMultipartFile(config[profile], vault, filename, arg)
         elif opt in ['--delete']:
             requireVault(opt)
             deleteFile(config[profile], vault, arg)
