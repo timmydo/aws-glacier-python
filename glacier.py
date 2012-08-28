@@ -35,6 +35,7 @@ import json
 from urllib.parse import urlparse,parse_qs
 #from email.utils import formatdate
 import datetime
+from time import sleep
 
 DEFAULT_REGION='us-east-1'
 DEFAULT_HOST='glacier.us-east-1.amazonaws.com'
@@ -45,6 +46,7 @@ DEFAULT_PROFILE='DEFAULT'
 
 ONE_MB=1024*1024*1
 
+
 def getConfigFilename():
     fname = os.path.expanduser(CONFIG_PATH)
     return fname
@@ -52,8 +54,9 @@ def getConfigFilename():
 def makeProfile(config, profile):
     items = {}
     defaults = {'id': '', 'key': '', 'region': DEFAULT_REGION,
-                       'debug': '0',
-                       'host': DEFAULT_HOST, 'port': str(DEFAULT_PORT)}
+                'debug': '0', 'log': '~/.awslog', 'chunksize': '4',
+                'maxtries': '20',
+                'host': DEFAULT_HOST, 'port': str(DEFAULT_PORT)}
     if profile in config:
         items = config[profile]
     for key in defaults.keys():
@@ -358,6 +361,8 @@ def findUploadedFileOffset(config, vault, uploadid):
     while True:
         res, reply = listParts(config, vault, uploadid, marker)
         partreply = json.loads(reply.decode('utf-8'))
+        if 'Parts' not in partreply:
+            raise KeyError('Parts not in ' + str(partreply))
         parts += partreply['Parts']
         marker = partreply['Marker']
         if marker == None:
@@ -379,6 +384,7 @@ def treehashFromList(thl, start, end):
 def checkHashes(config, vault, filename, uploadid):
     offset, parts = findUploadedFileOffset(config, vault, uploadid)
     badhashes = []
+    print("Hashing file: " + str(filename))
     fullhash, treehash, thl = hashfile(filename)
     for part in parts:
         rng = [int(x) for x in part['RangeInBytes'].split('-')]
@@ -387,14 +393,16 @@ def checkHashes(config, vault, filename, uploadid):
         if mytreehash not in part['SHA256TreeHash']:
             badhashes += [part]
             print("Hash mismatch: " + str(part) + "\nExpected: " + str(mytreehash)
-                  + "\nAt offset: " + str(rng[0]//1024//1024) + " MB to "
-                  + str(rng[1]//1024//1024) + ' MB')
+                  + "\nAt offset: " + str(rng[0]/1024/1024) + " MB to "
+                  + str(rng[1]/1024/1024) + ' MB')
     print('Checked ' + str(len(parts)) + ' hashes')
     print('Full file hash: ' + binascii.hexlify(fullhash).decode('ascii'))
     print('Full file treehash: ' + binascii.hexlify(treehash).decode('ascii'))
     return badhashes
         
-def repairMultipartFile(config, vault, filename, uploadid, partsize=1024*1024*4):
+def repairMultipartFile(config, vault, filename, uploadid, partsize=None):
+    if partsize == None:
+        partsize = int(config['chunksize'])*ONE_MB
     parts = checkHashes(config, vault, filename, uploadid)
     for part in parts:
         rng = [int(x) for x in part['RangeInBytes'].split('-')]
@@ -418,13 +426,22 @@ def repairMultipartFile(config, vault, filename, uploadid, partsize=1024*1024*4)
         #req.hideResponseHeaders = True
         res, reply = req.send(config)
         if res.status != 204:
-            raise ValueError('Expected 204 response from multipart PUT request @ offset ' + str(offset))
+            raise ValueError('Expected 204 response from multipart PUT request @ offset '
+                             + str(offset) + '\n' 
+                             + str(res.reason) + '\n' 
+                             + str(res.headers) + '\n'
+                             + str(reply))
 
         print('Repaired part at offset ' + str(offset) + ' (' + str(offset//1024//1024) + ' MB)')
 
 
 
-def multipartUploadFile(config, vault, filename, description=None, uploadid=None, partsize=1024*1024*4):
+def multipartUploadFile(config, vault, filename, description=None, uploadid=None, partsize=None,maxtries=None):
+    if partsize == None:
+        partsize = int(config['chunksize'])*ONE_MB
+    if maxtries == None:
+        maxtries = int(config['maxtries'])
+
     offset = 0
     size = os.stat(filename).st_size
 
@@ -459,18 +476,39 @@ def multipartUploadFile(config, vault, filename, description=None, uploadid=None
         req.addContentLength()
         req.sign()
         req.hideResponseHeaders = True
-        res, reply = req.send(config)
-        if res.status != 204:
-            raise ValueError('Expected 204 response from multipart PUT request @ offset ' + str(offset))
+        try:
+            res, reply = req.send(config)
+            if res.status != 204:
+                print('Expected 204 response from multipart PUT request @ offset '
+                      + str(offset) + '\n' 
+                      + str(res.reason) + '\n'
+                      + str(res.headers) + '\n' 
+                      + str(reply))
+                maxtries -= 1
+                if maxtries < 1:
+                    print('Try limit exceeded...exiting')
+                    return
+                continue
 
-        print('Uploaded ' + str(len(part)/1024/1024) + ' MB @ offset ' + str(offset) + ' bytes (' + str(offset//1024//1024) + ' MB)')
-        offset += len(part)
+
+            print('Uploaded ' + str(len(part)/1024/1024) + ' MB @ offset ' + str(offset) + ' bytes (' + str(offset//1024//1024) + ' MB)')
+            offset += len(part)
+        except socket.error as e:
+            print('Socket error: ' + str(e))
+            if maxtries < 1:
+                print('Try limit exceeded...exiting')
+                return
+            print('Retrying...')
+            sleep(1)
+            maxtries -= 1
 
     print('Calculating hash and finishing upload of ' + filename)
+    # calculate hash before creating the request otherwise it might be out of date by the time
+    # we send the request
+    linearhash, treehash, thl = hashfile(filename)
 
     req = Request(config, 'POST', '/-/vaults/' + vault + '/multipart-uploads/'+uploadid)
     req.headers['x-amz-archive-size'] = str(size)
-    linearhash, treehash, thl = hashfile(filename)
     req.headers['x-amz-sha256-tree-hash'] = binascii.hexlify(treehash).decode('ascii')
     req.addContentLength()
     req.sign()
@@ -479,6 +517,14 @@ def multipartUploadFile(config, vault, filename, description=None, uploadid=None
     print('Uploaded ' + filename)
     if res.status != 201:
         raise ValueError('Expected 201 Created response from upload finish request')
+    if 'log' in config and len(config['log']) > 0:
+        path = os.path.expanduser(config['log'])
+        location = uploadid
+        if 'Location' in res.headers:
+            location = res.headers['Location']
+        with open(path, 'a') as fd:
+            fd.write(str(filename) + '->' + location + '\n')
+            print('Wrote upload log entry to ' + path)
 
 
 def listUploads(config, vault):
@@ -525,9 +571,9 @@ def usage():
     print('\nUsage: ' + me + ' [options]\n');
     print('  --vault               Set the vault name for file operations later on the command line');
     print('  --description         Set the file description for file operations later');
-    print('  --upload              Single part upload of a file');
-    print('  --mupload             Multipart upload of a file');
-    print('  --resumeupload        Resume a multipart upload of a file');
+    print('  --supload             Single part upload of a file (Not recommended)');
+    print('  --upload              Multipart upload of a file');
+    print('  --resume              Resume a multipart upload of a file');
     print('  --checkhashes         Check hashes on a paused multipart upload of a file');
     print('  --listuploads         List the current multipart uploads');
     print('  --listparts           List the parts of a multipart upload');
@@ -564,12 +610,11 @@ def usage():
     print('')
     print('  '+ me + ' --makevault test')
     print('  '+ me + ' --vault test --upload ~/examples.desktop')
-    print('  '+ me + ' --vault test --multipartupload ~/examples.desktop')
     print('  '+ me + ' --vault test --delete <ArchiveId>')
     print('  '+ me + ' --vault test --listuploads')
     print('  '+ me + ' --vault test --abortupload <MultipartUploadId>')
     print('  '+ me + ' --vault test --listparts <MultipartUploadId>')
-    print('  '+ me + ' --vault test --filename <filename> --resumeupload <MultipartUploadId>')
+    print('  '+ me + ' --vault test --filename <filename> --resume <MultipartUploadId>')
     print('  '+ me + ' --vault test --filename <filename> --checkhashes <MultipartUploadId>')
     print('  '+ me + ' --vault test --filename <filename> --repairparts <MultipartUploadId>')
     print('')
@@ -593,10 +638,11 @@ def main():
                                                      'region=','id=','key=',
                                                      'makevault=', 'deletevault=',
                                                      'describevault=', 'listvaults',
-                                                     'vault=', 'upload=', 'delete=',
+                                                     'vault=', 'supload=', 'delete=',
                                                      'createjob=', 'listjobs', 'getjob=',
                                                      'joboutput=', 'archive=',
-                                                     'mupload=', 'listuploads', 'abortupload=',
+                                                     'upload=', 'multipartupload=',
+                                                     'listuploads', 'abortupload=',
                                                      'filename=', 'resume=', 'listparts=',
                                                      'checkhashes=', 'repairparts=',
                                                      'profile=', 'makeprofile='])
@@ -621,10 +667,10 @@ def main():
             filename = arg
         elif opt in ['--archive']:
             archive = arg
-        elif opt in ['--upload']:
+        elif opt in ['--supload']:
             requireVault(opt)
             uploadFile(config[profile], vault, arg, description)
-        elif opt in ['--mupload']:
+        elif opt in ['--upload', '--multipartupload']:
             requireVault(opt)
             multipartUploadFile(config[profile], vault, arg, description, None)
         elif opt in ['--listparts']:
