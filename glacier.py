@@ -83,10 +83,15 @@ def readConfig(section='DEFAULT'):
     print('Reading configuration from: ' + fname)
     config = configparser.ConfigParser()
     config.read(fname)
-    if (section not in config or 'id' not in config[section] or 'debug' not in config[section] ):
+    if section not in config:
         print('Section ' + section + ' not found in config file')
         generateConfig(fname, section)
         config.read(fname)
+    for part in ['host', 'region', 'key', 'id', 'debug', 'port', 'log', 'chunksize', 'maxtries']:
+        if (part not in config[section]):
+            print('Field ' + part + ' not found in config file section ' + section)
+            generateConfig(fname, section)
+            config.read(fname)
     return config
 
 def hexhash(data):
@@ -657,7 +662,7 @@ def main():
     for opt, arg in options:
         if opt in ['--region']:
             config[profile]['region'] = arg
-            config[profile]['host'] = 'glacier.' + region + '.amazonaws.com'
+            config[profile]['host'] = 'glacier.' + arg + '.amazonaws.com'
             saveConfig(config)
         elif opt in ['--vault']:
             vault = arg
