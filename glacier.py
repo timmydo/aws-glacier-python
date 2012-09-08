@@ -28,14 +28,19 @@ import socket
 import hmac
 import configparser
 import os
-import http.client
 import io
 import json
 
-from urllib.parse import urlparse,parse_qs
 #from email.utils import formatdate
 import datetime
 from time import sleep
+
+if sys.version < '3':
+    from httplib import HTTPConnection
+    from urlparse import urlparse, parse_qs
+else:
+    from http.client import HTTPConnection
+    from urllib.parse import urlparse, parse_qs
 
 DEFAULT_REGION='us-east-1'
 DEFAULT_HOST='glacier.us-east-1.amazonaws.com'
@@ -74,7 +79,7 @@ def saveConfig(config, fname=None):
 def generateConfig(fname, profile=DEFAULT_PROFILE):
     print('Generating configuration file: ' + fname)
     config = configparser.ConfigParser()
-    config.read(fname)
+    config.read([fname])
     makeProfile(config, profile)
     saveConfig(config, fname)
 
@@ -82,16 +87,16 @@ def readConfig(section='DEFAULT'):
     fname = getConfigFilename()
     print('Reading configuration from: ' + fname)
     config = configparser.ConfigParser()
-    config.read(fname)
+    config.read([fname])
     if section not in config:
         print('Section ' + section + ' not found in config file')
         generateConfig(fname, section)
-        config.read(fname)
+        config.read([fname])
     for part in ['host', 'region', 'key', 'id', 'debug', 'port', 'log', 'chunksize', 'maxtries']:
         if (part not in config[section]):
             print('Field ' + part + ' not found in config file section ' + section)
             generateConfig(fname, section)
-            config.read(fname)
+            config.read([fname])
     return config
 
 def hexhash(data):
@@ -275,7 +280,7 @@ class Request():
         return s
 
     def send(self, config, outfile=None):
-        con = http.client.HTTPConnection(config['host'], int(config['port']))
+        con = HTTPConnection(config['host'], int(config['port']))
         con.set_debuglevel(self.debug)
         con.request(self.method, self.url, self.payload, self.headers)
 
@@ -434,7 +439,7 @@ def repairMultipartFile(config, vault, filename, uploadid, partsize=None):
             raise ValueError('Expected 204 response from multipart PUT request @ offset '
                              + str(offset) + '\n' 
                              + str(res.reason) + '\n' 
-                             + str(res.headers) + '\n'
+                             + str(res.getheaders()) + '\n'
                              + str(reply))
 
         print('Repaired part at offset ' + str(offset) + ' (' + str(offset//1024//1024) + ' MB)')
@@ -461,9 +466,9 @@ def multipartUploadFile(config, vault, filename, description=None, uploadid=None
         req.sign()
         req.hideResponseHeaders = True
         res, reply = req.send(config)
-        if 'x-amz-multipart-upload-id' not in res.headers:
+        uploadid = res.getheader('x-amz-multipart-upload-id')
+        if not uploadid:
             raise KeyError('x-amz-multipart-upload-id not in response headers')
-        uploadid = res.headers['x-amz-multipart-upload-id']
         print('Starting upload of ' + filename)
         print('Upload ID: ' + str(uploadid))
     else:
@@ -487,7 +492,7 @@ def multipartUploadFile(config, vault, filename, description=None, uploadid=None
                 print('Expected 204 response from multipart PUT request @ offset '
                       + str(offset) + '\n' 
                       + str(res.reason) + '\n'
-                      + str(res.headers) + '\n' 
+                      + str(res.getheaders()) + '\n'
                       + str(reply))
                 maxtries -= 1
                 if maxtries < 1:
@@ -524,9 +529,7 @@ def multipartUploadFile(config, vault, filename, description=None, uploadid=None
         raise ValueError('Expected 201 Created response from upload finish request')
     if 'log' in config and len(config['log']) > 0:
         path = os.path.expanduser(config['log'])
-        location = uploadid
-        if 'Location' in res.headers:
-            location = res.headers['Location']
+        location = res.getheader('Location', uploadid)
         with open(path, 'a') as fd:
             fd.write(str(filename) + '->' + location + '\n')
             print('Wrote upload log entry to ' + path)
